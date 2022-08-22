@@ -32,12 +32,14 @@ void init_disk() {
 	=> an inode is:
 		u8 type
 		u64 address					- node metadata
-	=> node data is:
-		32 bytes filename
-		u64 size					- total size of node data
-		u32 num data sections
-		u64 data section address + length pairs
-		node data
+	=> node data is of 2 parts:
+		1. metadata (addressed by inode)
+			-----
+			32 bytes filename
+			u64 size					- total size of node data
+			u32 num data sections
+			u64 data section address + length pairs
+		2. data sections (not necessarily following metadata - use metadata's section addresses)
 
 	INODE TYPES:
 	0 - deleted
@@ -156,6 +158,7 @@ int32_t new_node(uint8_t* name, uint32_t data_size, uint32_t parent_inode, uint8
 
 	// write new node's metadata
 
+	memset(&disk[metadata_address], 0, 32);
 	memcpy(&disk[metadata_address], name, strlen(name));
 	*(uint64_t*)(disk + metadata_address + 32) = data_size;
 	*(uint32_t*)(disk + metadata_address + 40) = data_size > 0;
@@ -165,6 +168,55 @@ int32_t new_node(uint8_t* name, uint32_t data_size, uint32_t parent_inode, uint8
 	return inode;
 }
 
+// returns 0 on success, 1 on failure
+uint32_t resize_node(uint32_t inode, uint64_t new_size) {
+	// get address of the inode's metadata.
+	uint64_t metadata_address = *(uint64_t*)(disk + FS_INFO_SIZE + inode * INODE_SIZE + 1);
+	uint64_t* node_size			= (uint64_t*)(disk + metadata_address + 32);
+	uint32_t* num_sections		= (uint32_t*)(disk + metadata_address + 40);
+	uint64_t* section_address	= (uint64_t*)(disk + metadata_address + 44);
+	uint64_t* section_length	= (uint64_t*)(disk + metadata_address + 52);
+
+	if(new_size == *node_size)
+		return 0;
+
+	if(!new_size) {			// size of 0 = no data sections
+		*node_size = 0;		// set node size to 0
+		*num_sections = 0;	// set num data sections to 0
+		return 0;
+	}
+
+	if(!*node_size) {	// original has no data sections
+		uint64_t address = locate_space(new_size);
+		if(!address) return 1;		// resize failed - not enough space on disk for resized file
+
+		*node_size = new_size;		// set node size
+		*num_sections = 1;			// set num of data sections
+		*section_address = address;	// set data section address
+		*section_length = new_size;	// set data section length
+		return 0;
+	}
+
+	if(new_size < *node_size) {		// truncation
+		*node_size = new_size;		// set node size
+		*section_length = new_size;	// set data section length
+		return 0;
+	} else if(new_size > *node_size) {		// expand file with 0s
+		uint64_t address = locate_space(new_size);
+		if(!address) return 1;		// resize failed - not enough space on disk to create a resized copy of file
+
+		// copy data from old address to the new address
+
+		memmove(&disk[address], &disk[*section_address], *node_size);
+		memset(&disk[address] + *node_size, 0, new_size - *node_size);
+
+		// update the node's metadata
+
+		*node_size = new_size;
+		*section_address = address;
+		*section_length = new_size;
+	}
+}
 
 
 
