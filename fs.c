@@ -75,11 +75,13 @@ int32_t new_node(uint8_t* name, uint32_t n_bytes_data, uint32_t parent_inode, ui
 	used_regions = realloc(used_regions, sizeof(uint64_t) * (n_used_regions+1));
 	used_region_lengths = realloc(used_region_lengths, sizeof(uint64_t) * (n_used_regions+1));
 	used_regions[n_used_regions] = min_address;
-	used_region_lengths[n_used_regions] = metadata_width + n_bytes_data - 1;
+	used_region_lengths[n_used_regions] = metadata_width + n_bytes_data;
 	n_used_regions++;
 
 	// write node's metadata
 	write_metadata(min_address, name, metadata_width + n_bytes_data);
+
+	return inode;
 }
 
 
