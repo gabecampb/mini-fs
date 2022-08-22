@@ -8,117 +8,159 @@
 #include <string.h>
 
 uint8_t* disk;			
-uint64_t disk_size = 512000000;		// 512 MB disk
+
+#define DISK_CAPACITY 512000000
+#define INODES_CAPACITY 512
+
+#define MAX_FRAGMENTS 1			/* maximum number of sections a node can be split up into */
 
 void init_disk() {
-	disk = calloc(1, disk_size);
+	disk = calloc(1, DISK_CAPACITY);
+
+	*(uint32_t*)disk = INODES_CAPACITY;				// set max number of inodes
 }
 
-//				DISK SECTIONS (from start to end)
-//
-// inodes table (fixed count)
-// 		max (summed) number of files and directories
-//		each inode is 9 bytes - this is address in disk to filename + size (file metadata), then file sections, which is followed by file data.
-//		each directory is a file that lists all inodes (files/dirs) contained within it - everything is a file.
-// 		inodes must be at fixed locations since directories will list inode indices.
-// node data (file contents)
+#define MAX_FRAGMENTS 1			/* maximum number of sections a node can be split up into; fragmentation not supported yet so this should be 1 */
+#define METADATA_SIZE 44+(MAX_FRAGMENTS*16)		/* 32 bytes for filename, u32 for data size, u32 for num data sections */
 
-uint32_t n_max_inodes = 512;
-uint8_t* used_inode_states;		// for each of n_used_inodes, 0 for existing inodes and 1 for deleted inodes
-uint32_t n_used_inodes;
-uint32_t* deleted_inodes;		// list of all currently deleted (unused) inodes
-uint32_t n_deleted_inodes;
-uint32_t inode_width = 9;
+/*	=> the disk starts with fs info:
+		u32 n_max_inodes			- how many inodes the fs has
+		u32 n_active_inodes			- how many inodes are active
+		u32 n_deleted_inodes		- how many inodes have been deleted
 
-uint32_t metadata_width = 33;	// 32 bytes for filename, 1 byte for node type (directory/file)
+	=> then comes the inodes, followed by all of the node data
+	=> an inode is:
+		u8 type
+		u64 address					- node metadata
+	=> node data is:
+		32 bytes filename
+		u64 size					- total size of node data
+		u32 num data sections
+		u64 data section address + length pairs
+		node data
 
-uint64_t* used_regions;
-uint64_t* used_region_lengths;
-uint32_t n_used_regions;
+	INODE TYPES:
+	0 - deleted
+	1 - file
+	2 - directory
+*/
+
+#define FS_INFO_SIZE 12
+#define INODE_SIZE 9
+
+uint32_t get_inodes_capacity() {
+	return *(uint32_t*)disk;
+}
+
+uint32_t get_num_active_inodes() {
+	return *(uint32_t*)(disk + 4);
+}
+
+uint32_t get_num_deleted_inodes() {
+	return *(uint32_t*)(disk + 8);
+}
 
 
+
+
+
+// find first active but deleted inode on fs
+uint32_t find_first_deleted_inode() {
+	uint32_t inode_cap = get_inodes_capacity();
+	for(uint32_t i = 0; i < inode_cap; i++)
+		if(disk[FS_INFO_SIZE + i * INODE_SIZE] == 0) {
+			*(uint32_t*)(disk + 8) -= 1;	// decrease number of deleted inodes
+			return i;
+		}
+}
 
 // add a new inode to the inode table and return its ID, or -1 on fail
-// reuse a deleted inode if applicable
 int32_t new_inode() {
-	if(n_deleted_inodes > 1) {
-		int32_t inode = deleted_inodes[n_deleted_inodes-1];
-		deleted_inodes = realloc(deleted_inodes, sizeof(uint32_t) * (n_deleted_inodes - 1));
-		used_inode_states[inode] = 0;	// restored inode; mark as existing
-		n_deleted_inodes--;
-		return inode;
-	} else if(n_deleted_inodes == 1) {
-		int32_t inode = deleted_inodes[0];
-		free(deleted_inodes);
-		deleted_inodes = 0;
-		used_inode_states[inode] = 0;	// restored inode; mark as existing
-		n_deleted_inodes--;
+	if(get_num_deleted_inodes()) {		// restore a deleted inode
+		uint32_t inode = find_first_deleted_inode();
 		return inode;
 	}
-
-	if(n_used_inodes + 1 > n_max_inodes) return -1;
-	used_inode_states = realloc(used_inode_states, sizeof(uint8_t) * (n_used_inodes + 1));
-	used_inode_states[n_used_inodes] = 0;	// mark inode as existing
-	return n_used_inodes++;
+	if(get_num_active_inodes() + 1 > get_inodes_capacity())
+		return -1;
+	*(uint32_t*)(disk + 4) += 1;			// increment num active inodes
+	return get_num_active_inodes() - 1;
 }
 
-// mark an inode in the inode table as deleted, and remove associated node from used_regions
 void delete_inode(uint32_t inode) {
-	if(inode >= n_used_inodes) return;
-	for(uint32_t i = 0; i < n_used_regions; i++)
-		if(used_regions[i] == *(uint64_t*)&disk[inode * inode_width + 1]) {
-			// remove used_regions[i] and used_region_lengths[i]
-			used_regions[i] = used_regions[n_used_regions - 1];
-			used_region_lengths[i] = used_region_lengths[n_used_regions - 1];
-			used_regions = realloc(used_regions, sizeof(uint64_t) * (n_used_regions - 1));
-			used_region_lengths = realloc(used_region_lengths, sizeof(uint64_t) * (n_used_regions - 1));
-			n_used_regions--;
-		}
-	used_inode_states[inode] = 1;	// mark inode as deleted
-	deleted_inodes = realloc(deleted_inodes, sizeof(uint32_t) * (n_deleted_inodes + 1));
-	deleted_inodes[n_deleted_inodes] = inode;
-	n_deleted_inodes++;
+	disk[FS_INFO_SIZE + inode * INODE_SIZE] = 0;
+	*(uint32_t*)(disk + 8) += 1;	// increase number of deleted inodes
 }
 
-// name should be null-terminated and with a max length of 32.
-void write_metadata(uint64_t address, uint8_t* name, uint64_t node_size) {
-	memcpy(&disk[address], name, strlen(name));
-	*(uint64_t*)(disk + address + 32) = node_size;
+// locate a space in the node data region. returns address to space or 0 on fail.
+uint64_t locate_space(uint64_t size) {
+	uint64_t min_address = FS_INFO_SIZE + get_inodes_capacity() * INODE_SIZE;
+	uint64_t max_address = min_address + size - 1;
+
+	uint32_t n_active_inodes = get_num_active_inodes();
+	for(uint32_t i = 0; i < n_active_inodes; i++) {
+		if(disk[FS_INFO_SIZE + i * INODE_SIZE] == 0)
+			continue;		// if current inode is deleted, continue (it could not overlap with the new node data)
+
+		// check if this inode's node metadata overlaps with range min_address to max_address
+
+		uint64_t metadata_address = *(uint64_t*)(disk + FS_INFO_SIZE + i * INODE_SIZE + 1);
+
+		if(max_address >= metadata_address && metadata_address + METADATA_SIZE - 1 >= min_address) {
+			min_address = metadata_address + METADATA_SIZE;
+			max_address = min_address + size - 1;
+		}
+
+		// check if this inode's node data sections overlap with range min_address to max_address
+
+		uint32_t section_count = *(uint32_t*)(disk + metadata_address + 40);
+		uint64_t* sections = (uint64_t*)(disk + metadata_address + 44);			// data section address + length pairs
+		uint8_t has_overlap = 0;
+		uint64_t max_address_section = 0;
+		for(uint32_t j = 0; j < section_count; j++) {
+			if(sections[j * 2] > max_address_section)
+				max_address_section = j;
+			if(max_address >= sections[j * 2] && sections[j * 2] + sections[j * 2 + 1] - 1 >= min_address)
+				has_overlap = 1;
+		}
+		if(has_overlap) {		// collision found between new node and this inode's node data, set a new range
+			min_address = sections[max_address_section * 2] + sections[max_address_section * 2 + 1];
+			max_address = min_address + size - 1;
+		}
+	}
+	if(max_address >= DISK_CAPACITY)
+		return 0;
+
+	return min_address;
 }
 
 // add a new file/directory and its metadata, return file ID (inode) or -1 on fail
-int32_t new_node(uint8_t* name, uint32_t n_bytes_data, uint32_t parent_inode, uint8_t node_type) {
-	if(strlen(name) > 32) return -1;	// node name is too long
-	// find location of new file (no fragmentation yet)
-	uint64_t min_address = n_max_inodes * inode_width;
-	uint64_t max_address = min_address + metadata_width + n_bytes_data - 1;
-	if(max_address >= disk_size) return -1;
-	for(uint32_t i = 0; i < n_used_regions; i++)
-		if(max_address >= used_regions[i] && used_regions[i] + used_region_lengths[i] >= min_address) {
-			// found collision between existing node data and new node data, try checking for space after the existing node data
-			min_address = used_regions[i] + used_region_lengths[i];
-			max_address = min_address + metadata_width + n_bytes_data - 1;
-			if(max_address >= disk_size) return -1;
-		}
+int32_t new_node(uint8_t* name, uint32_t data_size, uint32_t parent_inode, uint8_t node_type) {
+	if(strlen(name) > 32 || !node_type) return -1;
+
+	uint64_t metadata_address = locate_space(METADATA_SIZE + data_size);
+	if(!metadata_address) return -1;		// no space for node data on disk
+
+	uint64_t min_address = metadata_address + METADATA_SIZE;		// node data
+	uint64_t max_address = min_address + data_size - 1;
 
 	// get new inode
+
 	int32_t inode = new_inode();
 	if(inode == -1) return -1;
-	
+
 	// update inode info
-	uint8_t* iptr = &disk[inode * inode_width];
+
+	uint8_t* iptr = &disk[FS_INFO_SIZE + inode * INODE_SIZE];
 	*iptr = node_type;
-	*(uint64_t*)(iptr + 1) = min_address;
+	*(uint64_t*)(iptr + 1) = metadata_address;			// set inode to address of the start of node's metadata 
 
-	// add min_address, max_address to used_regions.
-	used_regions = realloc(used_regions, sizeof(uint64_t) * (n_used_regions + 1));
-	used_region_lengths = realloc(used_region_lengths, sizeof(uint64_t) * (n_used_regions + 1));
-	used_regions[n_used_regions] = min_address;
-	used_region_lengths[n_used_regions] = metadata_width + n_bytes_data;
-	n_used_regions++;
+	// write new node's metadata
 
-	// write node's metadata
-	write_metadata(min_address, name, metadata_width + n_bytes_data);
+	memcpy(&disk[metadata_address], name, strlen(name));
+	*(uint64_t*)(disk + metadata_address + 32) = data_size;
+	*(uint32_t*)(disk + metadata_address + 40) = data_size > 0;
+	*(uint64_t*)(disk + metadata_address + 44) = min_address;
+	*(uint64_t*)(disk + metadata_address + 52) = data_size;
 
 	return inode;
 }
