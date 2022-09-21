@@ -11,17 +11,8 @@ uint8_t* disk;
 
 #define DISK_CAPACITY 512000000
 #define INODES_CAPACITY 512
-
-#define MAX_FRAGMENTS 1			/* maximum number of sections a node can be split up into */
-
-void init_disk() {
-	disk = calloc(1, DISK_CAPACITY);
-
-	*(uint32_t*)disk = INODES_CAPACITY;				// set max number of inodes
-}
-
 #define MAX_FRAGMENTS 1			/* maximum number of sections a node can be split up into; fragmentation not supported yet so this should be 1 */
-#define METADATA_SIZE 44+(MAX_FRAGMENTS*16)		/* 32 bytes for filename, u32 for data size, u32 for num data sections */
+#define METADATA_SIZE (44+(MAX_FRAGMENTS*16))		/* 32 bytes for filename, u64 for data size, u32 for num data sections */
 
 /*	=> the disk starts with fs info:
 		u32 n_max_inodes			- how many inodes the fs has
@@ -62,6 +53,26 @@ uint32_t get_num_deleted_inodes() {
 	return *(uint32_t*)(disk + 8);
 }
 
+uint64_t get_node_size(uint32_t node) {
+	uint64_t metadata_address = *(uint64_t*)(disk + FS_INFO_SIZE + node * INODE_SIZE + 1);
+	return *(uint64_t*)(disk + metadata_address + 32);
+}
+
+void read_node(uint32_t node, uint8_t* data, uint64_t n_bytes) {
+	if(!n_bytes || n_bytes > get_node_size(node))
+		return;
+	uint64_t metadata_address = *(uint64_t*)(disk + FS_INFO_SIZE + node * INODE_SIZE + 1);
+	uint64_t data_address = *(uint64_t*)(disk + metadata_address + 44);
+	memmove(data, &disk[data_address], n_bytes);
+}
+
+void write_node(uint32_t node, uint8_t* data, uint64_t n_bytes) {
+	if(!n_bytes || n_bytes > get_node_size(node))
+		return;
+	uint64_t metadata_address = *(uint64_t*)(disk + FS_INFO_SIZE + node * INODE_SIZE + 1);
+	uint64_t data_address = *(uint64_t*)(disk + metadata_address + 44);
+	memmove(&disk[data_address], data, n_bytes);
+}
 
 
 
@@ -93,57 +104,107 @@ void delete_inode(uint32_t inode) {
 	*(uint32_t*)(disk + 8) += 1;	// increase number of deleted inodes
 }
 
-// locate a space in the node data region. returns address to space or 0 on fail.
+// check for node metadata/data overlap with address range min -> max. returns 1 on overlap, 0 otherwise.
+uint8_t check_overlap(uint32_t node, uint64_t min_address, uint64_t max_address) {
+	uint64_t metadata_address = *(uint64_t*)(disk + FS_INFO_SIZE + node * INODE_SIZE + 1);
+	if(max_address >= metadata_address && metadata_address + METADATA_SIZE - 1 >= min_address)
+		return 1;		// node metadata collides with address range
+	uint32_t section_count = *(uint32_t*)(disk + metadata_address + 40);
+	uint64_t* sections = (uint64_t*)(disk + metadata_address + 44);			// data section address + length pairs
+	for(uint32_t i = 0; i < section_count; i++)
+		if(max_address >= sections[i * 2] && sections[i * 2] + sections[i * 2 + 1] - 1 >= min_address)
+			return 1;
+	return 0;
+}
+
+uint64_t find_node_max_address(uint32_t node) {
+	uint64_t metadata_address = *(uint64_t*)(disk + FS_INFO_SIZE + node * INODE_SIZE + 1);
+	uint64_t max_address = metadata_address + METADATA_SIZE - 1;
+	uint32_t section_count = *(uint32_t*)(disk + metadata_address + 40);
+	uint64_t* sections = (uint64_t*)(disk + metadata_address + 44);			// data section address + length pairs
+	for(uint32_t i = 0; i < section_count; i++)
+		if(sections[i * 2] + sections[i * 2 + 1] - 1 > max_address)
+			max_address = sections[i * 2] + sections[i * 2 + 1] - 1;
+	return max_address;
+}
+
 uint64_t locate_space(uint64_t size) {
-	uint64_t min_address = FS_INFO_SIZE + get_inodes_capacity() * INODE_SIZE;
-	uint64_t max_address = min_address + size - 1;
-
+	uint64_t min_addr = FS_INFO_SIZE + get_inodes_capacity() * INODE_SIZE;
+	uint64_t max_addr = min_addr + size - 1;
 	uint32_t n_active_inodes = get_num_active_inodes();
+	uint8_t available = !n_active_inodes;
+
 	for(uint32_t i = 0; i < n_active_inodes; i++) {
-		if(disk[FS_INFO_SIZE + i * INODE_SIZE] == 0)
-			continue;		// if current inode is deleted, continue (it could not overlap with the new node data)
-
-		// check if this inode's node metadata overlaps with range min_address to max_address
-
-		uint64_t metadata_address = *(uint64_t*)(disk + FS_INFO_SIZE + i * INODE_SIZE + 1);
-
-		if(max_address >= metadata_address && metadata_address + METADATA_SIZE - 1 >= min_address) {
-			min_address = metadata_address + METADATA_SIZE;
-			max_address = min_address + size - 1;
+		if(disk[FS_INFO_SIZE + i * INODE_SIZE] == 0) continue;		// node i is deleted
+		min_addr = find_node_max_address(i) + 1;
+		max_addr = min_addr + size - 1;
+		uint8_t overlap = 0;
+		for(uint32_t j = 0; j < n_active_inodes; j++) {
+			if(disk[FS_INFO_SIZE + j * INODE_SIZE] == 0 || i == j)
+				continue;
+			if(check_overlap(j, min_addr, max_addr)) {
+				overlap = 1;
+				break;
+			}
 		}
-
-		// check if this inode's node data sections overlap with range min_address to max_address
-
-		uint32_t section_count = *(uint32_t*)(disk + metadata_address + 40);
-		uint64_t* sections = (uint64_t*)(disk + metadata_address + 44);			// data section address + length pairs
-		uint8_t has_overlap = 0;
-		uint64_t max_address_section = 0;
-		for(uint32_t j = 0; j < section_count; j++) {
-			if(sections[j * 2] > max_address_section)
-				max_address_section = j;
-			if(max_address >= sections[j * 2] && sections[j * 2] + sections[j * 2 + 1] - 1 >= min_address)
-				has_overlap = 1;
-		}
-		if(has_overlap) {		// collision found between new node and this inode's node data, set a new range
-			min_address = sections[max_address_section * 2] + sections[max_address_section * 2 + 1];
-			max_address = min_address + size - 1;
+		if(!overlap) {		// found available position; no need to continue search
+			available = 1;
+			break;
 		}
 	}
-	if(max_address >= DISK_CAPACITY)
-		return 0;
+	return available && max_addr < DISK_CAPACITY ? min_addr : 0;
+}
 
-	return min_address;
+uint32_t resize_node(uint32_t inode, uint64_t new_size);
+
+void add_child_node(uint32_t parent_node, uint32_t child_node) {
+	if(disk[FS_INFO_SIZE + parent_node * INODE_SIZE] != 2)
+		return;	// parent node must be a directory
+	if(resize_node(parent_node, get_node_size(parent_node) + 4) != 0)
+		return;	// no space on disk for new entry in node's parent directory
+
+	uint32_t node_size = get_node_size(parent_node);
+
+	uint32_t* list = calloc(1, node_size);
+	read_node(parent_node, (uint8_t*)list, node_size);
+	list[node_size / 4 - 1] = child_node;
+	write_node(parent_node, (uint8_t*)list, node_size);
+	free(list);
+}
+
+void remove_child_node(uint32_t parent_node, uint32_t child_node) {
+	if(disk[FS_INFO_SIZE + parent_node * INODE_SIZE] != 2)
+		return;	// parent node must be a directory
+
+	uint32_t node_size = get_node_size(parent_node);
+	uint32_t* list = calloc(1, node_size);
+	read_node(parent_node, (uint8_t*)list, node_size);
+
+	uint32_t n_entries = node_size / 4, found = 0;
+	for(uint32_t i = 0; i < n_entries; i++)
+		if(list[i] == child_node) {
+			list[i] = list[n_entries - 1];
+			found = 1;
+			break;
+		}
+
+	if(!found) return;	// dir entry for child not found
+	write_node(parent_node, (uint8_t*)list, node_size);
+	resize_node(parent_node, node_size - 4);
 }
 
 // add a new file/directory and its metadata, return file ID (inode) or -1 on fail
-int32_t new_node(uint8_t* name, uint32_t data_size, uint32_t parent_inode, uint8_t node_type) {
+int32_t new_node(uint8_t* name, uint32_t data_size, uint32_t parent_node, uint8_t node_type) {
 	if(strlen(name) > 32 || !node_type) return -1;
+	for(char c = 0; c < strlen(name); c++)
+		if(name[c] <= 0x1F || name[c] >= 0x7F || name[c] == ':' || name[c] == '|' || name[c] == '\\' || name[c] == '/'
+		||  name[c] == '*' || name[c] == '?'  || name[c] == '"' || name[c] == '<' || name[c] == '>')
+			return -1;
+
+	// find space for new node
 
 	uint64_t metadata_address = locate_space(METADATA_SIZE + data_size);
 	if(!metadata_address) return -1;		// no space for node data on disk
-
-	uint64_t min_address = metadata_address + METADATA_SIZE;		// node data
-	uint64_t max_address = min_address + data_size - 1;
 
 	// get new inode
 
@@ -162,10 +223,21 @@ int32_t new_node(uint8_t* name, uint32_t data_size, uint32_t parent_inode, uint8
 	memcpy(&disk[metadata_address], name, strlen(name));
 	*(uint64_t*)(disk + metadata_address + 32) = data_size;
 	*(uint32_t*)(disk + metadata_address + 40) = data_size > 0;
-	*(uint64_t*)(disk + metadata_address + 44) = min_address;
+	*(uint64_t*)(disk + metadata_address + 44) = metadata_address + METADATA_SIZE;		// set node's data section address
 	*(uint64_t*)(disk + metadata_address + 52) = data_size;
 
+	if(inode)		// skip for root dir init (don't add root dir as child of root dir)
+		add_child_node(parent_node,inode);
+
 	return inode;
+}
+
+// delete a file/directory and its metadata
+void delete_node(uint32_t parent_node, uint32_t node) {
+	if(!node) return;			// cannot delete root dir node
+
+	remove_child_node(parent_node, node);
+	delete_inode(node);
 }
 
 // returns 0 on success, 1 on failure
@@ -200,10 +272,10 @@ uint32_t resize_node(uint32_t inode, uint64_t new_size) {
 	if(new_size < *node_size) {		// truncation
 		*node_size = new_size;		// set node size
 		*section_length = new_size;	// set data section length
-		return 0;
 	} else if(new_size > *node_size) {		// expand file with 0s
 		uint64_t address = locate_space(new_size);
-		if(!address) return 1;		// resize failed - not enough space on disk to create a resized copy of file
+		if(!address)
+			return 1;		// resize failed - not enough space on disk to create a resized copy of file
 
 		// copy data from old address to the new address
 
@@ -216,8 +288,22 @@ uint32_t resize_node(uint32_t inode, uint64_t new_size) {
 		*section_address = address;
 		*section_length = new_size;
 	}
+	return 0;
 }
 
+// move a file or directory
+void move_node(uint32_t node, uint32_t parent_node, uint32_t dst_dir) {
+	remove_child_node(parent_node, node);
+	add_child_node(dst_dir, node);
+}
+
+void init_disk() {
+	disk = calloc(1, DISK_CAPACITY);
+	*(uint32_t*)disk = INODES_CAPACITY;				// set max number of inodes
+
+	// create the root directory
+	int32_t root_node = new_node("", 0, 0, 2);		// inode 0
+}
 
 
 int main() {
